@@ -24,20 +24,14 @@ RULE=SCALABILITY_LAB_LOAD_BALANCING_RULE
 REPO=https://github.com/SebasAuM/ARSW_LOAD-BALANCING_AZURE_LAB9_VEGA-AURELA.git
 OUT=~/parte2-resultados
 
-# Tamaños a probar en orden. Los B-series no admiten Spot, por eso los Spot son D/F.
-PLANES=(
-  "Standard_B1s Regular"
-  "Standard_B1ms Regular"
-  "Standard_B2ats_v2 Regular"
-  "Standard_B2als_v2 Regular"
-  "Standard_B2s Regular"
-  "Standard_D2as_v5 Spot"
-  "Standard_D2s_v5 Spot"
-  "Standard_D2s_v3 Spot"
-  "Standard_F2s_v2 Spot"
-  "Standard_D2as_v5 Regular"
-  "Standard_D2s_v3 Regular"
+# Tamaños preferidos, en orden. Si ninguno está disponible se prueba cualquier
+# otro tamaño x64 de 1-2 vCPU que la suscripción pueda usar en las 3 zonas.
+PREFERIDOS=(
+  Standard_B1s Standard_B1ms Standard_B2ats_v2 Standard_B2als_v2 Standard_B2s
+  Standard_D2as_v5 Standard_D2s_v5 Standard_D2as_v6 Standard_D2ads_v6
+  Standard_D2s_v3 Standard_F2s_v2 Standard_F2as_v6
 )
+MAX_PLANES=15
 
 log()  { printf '\n\033[1;36m>> %s\033[0m\n' "$*"; }
 ok()   { printf '   \033[32m✔ %s\033[0m\n' "$*"; }
@@ -53,28 +47,53 @@ az account show -o none 2>/dev/null || die "No hay sesión de Azure. Ejecuta: az
 mkdir -p "$OUT"
 
 # ---------------------------------------------------------------------------
-log "Buscando tamaños de VM disponibles en $LOC (zonas 1, 2 y 3)"
+log "Consultando tamaños de VM en $LOC (una sola consulta, 30-90 segundos)"
 
-# Imprime los vCPUs del tamaño si la suscripción lo puede usar en las 3 zonas
-vcpus_si_disponible() {
-  az vm list-skus -l $LOC --size "$1" --resource-type virtualMachines \
-    --query "[?name=='$1' && length(restrictions)==\`0\` && length(locationInfo[0].zones)>=\`3\`].capabilities[?name=='vCPUs'].value | [0][0]" \
-    -o tsv 2>/dev/null
-}
+# Columnas: nombre, vCPUs, arquitectura, generaciones, admite Spot, nº de zonas, restricciones
+SKUS="$OUT/skus.tsv"
+if [[ ! -s "$SKUS" ]]; then
+  az vm list-skus -l $LOC --resource-type virtualMachines --all \
+    --query "[].[name, capabilities[?name=='vCPUs'].value | [0], capabilities[?name=='CpuArchitectureType'].value | [0], capabilities[?name=='HyperVGenerations'].value | [0], capabilities[?name=='LowPriorityCapable'].value | [0], length(locationInfo[0].zones || \`[]\`), join(',', restrictions[].reasonCode || \`[]\`)]" \
+    -o tsv > "$SKUS" || die "No se pudo consultar el catálogo de tamaños"
+fi
 
-DISPONIBLES=()
-declare -A VCPUS
-for p in "${PLANES[@]}"; do
-  read -r size prio <<<"$p"
-  [[ -v VCPUS[$size] ]] || VCPUS[$size]=$(vcpus_si_disponible "$size")
-  if [[ -n "${VCPUS[$size]}" ]]; then
-    DISPONIBLES+=("$size $prio ${VCPUS[$size]}")
-    ok "$size ($prio, ${VCPUS[$size]} vCPU)"
-  else
-    warn "$size no disponible"
+declare -A VCPUS SPOT MOTIVO
+while IFS=$'\t' read -r name vcpu arch gens lowprio zonas restr; do
+  if [[ -n "$restr" ]]; then MOTIVO[$name]=$restr; continue; fi
+  if [[ "$arch" != x64 || "$gens" != *V2* || ! "$vcpu" =~ ^[0-9]+$ ]] || (( vcpu > 2 || zonas < 3 )); then
+    MOTIVO[$name]="no sirve para el lab (arq=$arch, zonas=$zonas, vCPU=$vcpu)"
+    continue
   fi
+  VCPUS[$name]=$vcpu
+  SPOT[$name]=$lowprio
+done < "$SKUS"
+
+# Plan = "tamaño prioridad vCPUs": primero los preferidos, luego el resto por vCPUs
+DISPONIBLES=()
+declare -A AGREGADO
+agregar_plan() {
+  local s=$1
+  [[ -v VCPUS[$s] && ! -v AGREGADO[$s] ]] || return 0
+  AGREGADO[$s]=1
+  DISPONIBLES+=("$s Regular ${VCPUS[$s]}")
+  [[ "${SPOT[$s]}" == True ]] && DISPONIBLES+=("$s Spot ${VCPUS[$s]}")
+}
+for s in "${PREFERIDOS[@]}"; do
+  if [[ -v VCPUS[$s] ]]; then
+    ok "$s disponible (${VCPUS[$s]} vCPU, Spot: ${SPOT[$s]})"
+  else
+    warn "$s: ${MOTIVO[$s]:-no existe en $LOC}"
+  fi
+  agregar_plan "$s"
 done
-(( ${#DISPONIBLES[@]} )) || die "Ningún tamaño está disponible en $LOC para esta suscripción."
+for s in $(for n in "${!VCPUS[@]}"; do echo "${VCPUS[$n]} $n"; done | sort -n | awk '{print $2}'); do
+  agregar_plan "$s"
+done
+DISPONIBLES=("${DISPONIBLES[@]:0:$MAX_PLANES}")
+
+(( ${#DISPONIBLES[@]} )) || die "Ningún tamaño x64 de 1-2 vCPU está disponible en las 3 zonas de $LOC. Revisa $SKUS"
+echo "   Orden en que se intentará crear cada VM:"
+printf '     %s\n' "${DISPONIBLES[@]}"
 
 # vCPUs libres de la cuota: cores (normales) o lowPriorityCores (Spot)
 cuota_libre() {
