@@ -203,3 +203,297 @@ El escenario pide que, con varios usuarios consultando valores de Fibonacci supe
 Con escalamiento vertical **no lo cumplimos**. Es cierto que la CPU nunca se acercó al 70%, pero eso no es una buena señal: significa que la app solo usa un núcleo y deja el resto ocioso. Lo que se ve afectado es la otra mitad del requerimiento: con carga concurrente las peticiones se encolan, los tiempos se disparan y aparecen *timeouts*. Hacer la máquina más grande no cambia esto, porque el límite lo pone el diseño de la aplicación (un hilo, algoritmo costoso) y no los recursos disponibles.
 
 Además, el escalamiento vertical tiene sus propios problemas: requiere reiniciar la VM, depende de que el tamaño esté disponible (cosa que no pasó) y sigue siendo un único punto de falla. Por eso la parte 2 apunta a escalar horizontalmente: varias instancias detrás de un balanceador de carga, de forma que las peticiones concurrentes se repartan entre máquinas en lugar de hacer fila en una sola.
+
+---
+
+## Parte 2 - Escalabilidad horizontal
+
+### Cómo armamos la infraestructura (y por qué no salió igual que en la guía)
+
+Arrancamos por el portal, como muestra la guía. Creamos el balanceador en *Brazil South* (ver la [imagen 12](images/12.png)) y también la red virtual con su subnet. La primera red la hicimos en *North Europe* siguiendo la imagen del enunciado:
+
+![Creación de la red virtual desde el portal](images/13.png)
+
+Al pasar a crear las máquinas nos topamos con los límites de la suscripción *Azure for Students*, y tuvimos que cambiar varias cosas:
+
+| Límite que encontramos | Qué hicimos |
+|---|---|
+| Casi todos los tamaños pequeños (serie B, A1_v2, D2s_v3, D2as_v5…) salen como `NotAvailableForSubscription` en Brazil South | Buscar qué tamaños sí estaban habilitados; quedaron los `D2ds_v4` y `D2d_v4` (2 vCPU, 8 GiB) |
+| Cuota de **6 vCPUs** normales por región y **4 por familia** de tamaño | VM1 y VM2 en `D2ds_v4`, VM3 en `D2d_v4` (otra familia) y VM4 como **Spot**, que tiene una cuota aparte de 3 vCPUs |
+| Solo **3 IPs públicas** por región | Las VMs no tienen IP pública propia: salen a internet con una *outbound rule* del balanceador y entramos por SSH con *inbound NAT rules* (puertos 50001-50004) |
+| Las subnets nuevas son privadas por defecto (en la imagen anterior se ve *Private subnet: Enabled*) | La misma *outbound rule* les da salida a internet para instalar Node y clonar el repo |
+
+Hacer todo esto a mano, VM por VM, era lento y propenso a errores. Por eso lo automatizamos con el script [parte2-azure.sh](parte2-azure.sh), que corre en Azure Cloud Shell. Esa es justamente la idea que menciona el enunciado sobre herramientas para automatizar el aprovisionamiento. El script:
+
+1. Crea el grupo `SCALABILITY_LAB_HORIZONTAL`, la VNet `10.1.0.0/16`, la subnet `10.1.0.0/24` y el NSG con los puertos 22 y 3000 abiertos.
+2. Crea el balanceador **Standard** público con:
+   - *Backend pool* `SCALABILITY_LAB_BACKEND_POOL`.
+   - *Health probe* TCP al puerto 3000 cada 5 s.
+   - *Load balancing rule* 80 → 3000 sin persistencia de sesión.
+   - *Outbound rule*.
+3. Crea cada VM en una zona distinta con Ubuntu 24.04. Revisa la cuota antes de cada una y, si un tamaño no cabe, prueba con el siguiente.
+4. Instala la app de forma automática con *cloud-init*: Node 22 LTS, `git clone` del repo, `npm install` y la app registrada como servicio de `systemd`. Usamos `systemd` en lugar de `forever` para que la app vuelva a arrancar sola si la VM se reinicia (o si Azure desaloja la VM Spot).
+
+La infraestructura final quedó así:
+
+| VM | Zona | Tamaño | Prioridad | IP privada |
+|---|:---:|---|---|---|
+| VM1 | 1 | Standard_D2ds_v4 | Normal | 10.1.0.4 |
+| VM2 | 2 | Standard_D2ds_v4 | Normal | 10.1.0.5 |
+| VM3 | 3 | Standard_D2d_v4 | Normal | 10.1.0.6 |
+| VM4 | 1 | Standard_D2ds_v4 | Spot | — |
+
+Brazil South solo tiene 3 zonas de disponibilidad, por eso VM4 quedó otra vez en la zona 1.
+
+### Probar el resultado final
+
+La IP pública del balanceador quedó en `20.195.246.246`. Los dos endpoints básicos respondieron bien a través de él:
+
+![Hello World a través del balanceador](images/1balanceador.png)
+
+![Fibonacci de 1 a través del balanceador](images/2balanceador.png)
+
+### Prueba con newman: 3 VMs y 2 ejecuciones en paralelo (punto 2)
+
+Corrimos las dos ejecuciones de newman desde nuestro PC. Al mismo tiempo dejamos abierto `journalctl -u fibonacci -f` en cada VM para ver en vivo a cuál le llegaba cada petición:
+
+![Logs de cada VM y resumen de newman](images/pruebasbalanceador.png)
+
+![Ejecución en curso con los logs de las VMs](images/logsypruebasbalanceador.png)
+
+Lo que se ve en las capturas:
+
+- **Ejecución sin errores:** 10 de 10 peticiones exitosas, con un tiempo promedio de **12.1 s** (mínimo 10.6 s, máximo 21.8 s, desviación de 3.2 s) y una duración total de 2 min 1.8 s.
+- **La otra ejecución:** tuvo un fallo `read ECONNRESET` en la iteración 3. El resto respondió `200 OK` en unos 11 s.
+- **Cómo se repartió la carga:** en los logs, cada cliente de newman quedó pegado a una sola VM. Las peticiones de uno llegaron todas a VM2 (19:12-19:13) y las del otro a VM1 (19:18-19:20), espaciadas unos 10-11 s, o sea una tras otra. VM3 casi no recibió trabajo en esta prueba: su servicio llevaba apenas 483 ms de CPU.
+
+**¿Por qué pasa esto?** Azure Load Balancer trabaja en la capa 4: reparte **conexiones TCP**, no peticiones HTTP, y elige la VM con un hash de 5 valores (IP y puerto de origen, IP y puerto de destino, protocolo). Newman reutiliza la misma conexión (*keep-alive*) para todas sus iteraciones, así que todas las peticiones de un mismo cliente terminan en la misma VM.
+
+**¿Y el `ECONNRESET`?** Aparece cuando dos clientes caen en la misma VM. Node atiende una petición a la vez, y mientras calcula Fibonacci(1.000.000), unos 11 s, el *event loop* queda bloqueado. La conexión del otro cliente supera los 5 s de *keep-alive* que Node tiene por defecto. Cuando el event loop se libera, Node cierra esa conexión justo cuando newman acababa de mandar su siguiente petición. Es el mismo cuello de botella de la parte 1, solo que ahora ocurre únicamente cuando dos clientes coinciden en la misma máquina.
+
+### Prueba con newman: 4 VMs y 4 ejecuciones en paralelo (punto 3)
+
+Agregamos VM4 (Spot, zona 1). Cuando el servicio quedó activo, lanzamos las 4 ejecuciones de newman al tiempo:
+
+![VM4 lista y arranque de las 4 ejecuciones](images/nuevavm.png)
+
+Al terminar, contamos en el log de cada VM cuántos cálculos atendió en total, sumando todas las pruebas de la parte 2:
+
+![Resumen de una ejecución y peticiones atendidas por VM](images/peticionesatendidas.png)
+
+| VM | Peticiones atendidas (acumulado) |
+|---|---:|
+| VM1 | 26 |
+| VM2 | 27 |
+| VM3 | 6 |
+| VM4 | 8 |
+
+La ejecución cuyo resumen quedó en la captura tuvo **2 fallos `ECONNRESET`** (iteraciones 2 y 4), un promedio de **22.6 s** (mínimo 10.6 s, máximo 51.5 s, desviación de 17.5 s) y recibió 1.67 MB, es decir unas 8 respuestas completas de 209 KB.
+
+#### Comportamiento de la CPU de las 4 VMs
+
+En *Azure Monitor → Metrics* graficamos la métrica **Percentage CPU** con agregación **Max**, filtrada al grupo de recursos y separada por VM:
+
+![CPU máxima de las 4 VMs](images/cpuuso.png)
+
+| VM | CPU máxima | Peticiones atendidas |
+|---|---:|---:|
+| VM1 | 56.08% | 26 |
+| VM2 | 53.37% | 27 |
+| VM3 | 47.67% | 6 |
+| VM4 | 44.96% | 8 |
+
+Lo que se ve en la gráfica:
+
+- **Todas las VMs llegan a un pico parecido, entre 45% y 56%, sin importar cuántas peticiones atendieron.** Mientras calcula un Fibonacci, una VM tiene **un núcleo al 100% y el otro casi libre**: son `D2` de 2 vCPUs y Node usa un solo hilo. Por eso el máximo ronda la mitad. Lo poco que pasa del 50% en VM1 y VM2 son el sistema operativo, el recolector de basura de Node y el tráfico de red ocupando un poco del segundo núcleo.
+- **La diferencia entre VMs no está en el pico, sino en cuánto tiempo estuvieron ocupadas.** VM1 y VM2, con 26-27 peticiones, se mantuvieron arriba casi toda la prueba. VM3 y VM4, con 6-8 peticiones, solo tuvieron picos cortos y luego bajaron a ~0%. Eso confirma el reparto desigual que vimos en los logs.
+- **Ninguna VM superó el 70%** que pide el escenario de calidad. Pero esto no significa que sobre capacidad: como en la parte 1, la app no puede aprovechar el segundo núcleo, así que la mitad de la CPU contratada se queda sin usar.
+
+#### ¿Por qué la tasa de éxito mejora con este estilo de escalabilidad?
+
+Con escalamiento vertical, todos los clientes concurrentes caen en **el mismo proceso de Node**. Las peticiones hacen fila detrás de cálculos de 10 s y, mientras más clientes hay, más conexiones se cierran o se vencen esperando. Con escalamiento horizontal cada VM tiene **su propio event loop**: si cada cliente cae en una VM diferente, todos se atienden en paralelo, sin fila, y responden en los ~11 s que tarda un cálculo. Agregar máquinas multiplica la cantidad de peticiones que se pueden atender al mismo tiempo, algo que una VM más grande no logra con esta app.
+
+En nuestras pruebas la mejora no fue perfecta por cómo reparte el balanceador. Con 4 clientes y 4 VMs, el hash hizo que varios clientes coincidieran en la misma máquina: VM1 y VM2 se llevaron casi todo y VM3 y VM4 muy poco. Ahí reaparecen la fila (el máximo de 51.5 s equivale a unas 4-5 peticiones esperando) y los `ECONNRESET`. Aun así, la mayoría de las peticiones se respondieron, y los clientes que quedaron solos en una VM tuvieron tiempos estables de ~11 s.
+
+Para repartir mejor convendría:
+- usar un balanceador de capa 7 (Application Gateway), que reparte **por petición** y no por conexión;
+- desactivar el *keep-alive* en los clientes;
+- correr la app en modo *cluster* de Node para usar los 2 núcleos de cada VM.
+
+### Informe comparativo: vertical vs. horizontal
+
+| Aspecto | Vertical (parte 1) | Horizontal (parte 2) |
+|---|---|---|
+| Infraestructura | 1 VM `D2s_v3` Spot (2 vCPU, 8 GiB) en East US 2 | 4 VMs `D2ds_v4`/`D2d_v4` (2 vCPU, 8 GiB) en 3 zonas + Load Balancer Standard |
+| Tiempo por petición sin competencia | 9.8 s – 11.9 s | 10.6 s – 11.1 s |
+| 2 clientes concurrentes | Comparten un solo event loop: cada petición espera a la del otro, unos 20 s | Promedio de 12.1 s cuando cada cliente cae en una VM distinta; 1 fallo cuando coinciden |
+| 4 clientes concurrentes | Toda la fila en un solo proceso: se esperan tiempos de unos 40 s y más fallos | Promedio de 22.6 s y 2 fallos en la ejecución medida, por clientes que coincidieron en la misma VM |
+| Tolerancia a fallos | Punto único de falla; cambiar el tamaño exige reiniciar | Si una VM o una zona cae, el health probe la saca y las demás siguen atendiendo |
+| Escalar más | Limitado al tamaño más grande disponible (y `B2ms` ni siquiera estaba habilitado) | Basta con agregar VMs al backend pool, sin apagar las que ya están |
+
+#### Costos por hora (precios públicos de Azure, Linux, pago por uso)
+
+| Recurso | Vertical | Horizontal |
+|---|---:|---:|
+| VMs | 1 × D2s_v3 Spot (East US 2) = **$0.037** | 3 × D2ds_v4/D2d_v4 ($0.18) + 1 × D2ds_v4 Spot ($0.033) = **$0.573** |
+| IP pública Standard | $0.005 | $0.005 (solo la del balanceador) |
+| Load Balancer Standard (hasta 5 reglas) | — | ~$0.025 + $0.005 por GB procesado |
+| **Total aproximado por hora** | **≈ $0.042** | **≈ $0.60** |
+| **Total aproximado al mes (730 h)** | **≈ $31** | **≈ $440** |
+
+Los precios de las VMs y de la IP salen de la API pública de precios de Azure (`prices.azure.com`), consultada el 28/10/2026. El del balanceador es la tarifa de referencia de la página de precios de Azure.
+
+La diferencia es enorme. Una parte viene de que en la parte 1 usamos Spot, que es mucho más barato. Otra parte viene de que Brazil South es una región cara: el mismo `D2ds_v4` cuesta $0.113/h en East US 2 y $0.18/h en Brazil South. Si la VM vertical hubiera sido normal (sin Spot), costaría $0.096/h, unos $70 al mes. Aun así, la horizontal sale **unas 6 veces más cara**.
+
+Ese costo extra paga dos cosas que la vertical no ofrece: atender varios clientes realmente en paralelo y sobrevivir a la caída de una máquina o de una zona entera. Para esta aplicación en particular, la solución más barata sería corregir el algoritmo y usar los dos núcleos de cada VM. Con eso se necesitarían menos máquinas.
+
+---
+
+## Preguntas de la parte 2
+
+### ¿Cuáles son los tipos de balanceadores de carga en Azure y en qué se diferencian?
+
+Azure tiene varios servicios de balanceo. Se diferencian por la capa del modelo OSI en la que trabajan y por si son regionales o globales:
+
+| Servicio | Capa | Alcance | Para qué sirve |
+|---|---|---|---|
+| **Azure Load Balancer** | 4 (TCP/UDP) | Regional | Repartir conexiones entre VMs; muy rápido y sin entender HTTP. Es el que usamos |
+| **Application Gateway** | 7 (HTTP/HTTPS) | Regional | Balanceo por petición, enrutamiento por URL o host, terminación TLS y firewall web (WAF) |
+| **Azure Front Door** | 7 | Global | Puerta de entrada global con CDN, aceleración y WAF para apps en varias regiones |
+| **Traffic Manager** | DNS | Global | Redirige a los usuarios a la región más cercana o disponible mediante respuestas DNS |
+| **Gateway Load Balancer** | 3/4 | Regional | Insertar dispositivos virtuales de red (firewalls, inspección) de forma transparente |
+
+Además, el Azure Load Balancer puede ser **público**, que recibe tráfico de internet con una IP pública, o **interno**, que balancea dentro de la VNet con una IP privada.
+
+### ¿Qué es SKU, qué tipos hay y en qué se diferencian?
+
+El **SKU** (*Stock Keeping Unit*) es la "edición" o nivel de un recurso. Define sus capacidades, sus límites, su SLA y su precio. Para el Load Balancer existen:
+
+- **Basic:** era gratis, admitía hasta 300 instancias, no tenía SLA ni soporte de zonas de disponibilidad y estaba abierto por defecto. **Azure lo retiró el 30 de septiembre de 2025**, junto con las IPs públicas Basic, así que hoy ya no es una opción.
+- **Standard:** el actual. Admite hasta 1000 instancias, tiene SLA del 99.99%, soporta zonas (zonal o con redundancia de zona), *outbound rules* y health probes HTTPS, y es **seguro por defecto**: no deja pasar tráfico si un NSG no lo permite. Se cobra por reglas y por datos procesados.
+- **Gateway:** pensado para encadenar dispositivos virtuales de red, no para balancear una aplicación.
+
+El concepto de SKU también se usa en otros recursos. Las IPs públicas, por ejemplo, tienen SKU Standard o Global, y los tamaños de VM (`Standard_D2ds_v4`) también son SKUs.
+
+### ¿Por qué el balanceador de carga necesita una IP pública?
+
+Porque es la **única puerta de entrada** al sistema desde internet. Los usuarios no conocen ni deben conocer las VMs individuales: le hablan a una sola dirección, `20.195.246.246`, y el balanceador decide qué VM atiende cada conexión. Así se pueden agregar, quitar o reemplazar VMs sin que el cliente se entere.
+
+En nuestro caso la IP pública cumplió además otros dos papeles:
+- **Salida a internet de las VMs** (SNAT con la *outbound rule*), porque ellas no tienen IP propia.
+- **Entrada por SSH** a cada VM mediante las reglas NAT.
+
+### ¿Cuál es el propósito del *Backend Pool*?
+
+Es el **grupo de máquinas** que van a recibir el tráfico del balanceador; en nuestro caso, las NICs de VM1 a VM4. La regla de balanceo apunta al pool y no a VMs concretas, así que escalar horizontalmente es tan simple como meter una VM más al pool. Eso fue lo que hicimos con VM4, sin tocar la configuración del balanceador ni interrumpir a las demás.
+
+### ¿Cuál es el propósito del *Health Probe*?
+
+Revisar periódicamente si cada VM del pool está en condiciones de recibir tráfico. Configuramos una sonda TCP al puerto 3000 cada 5 segundos: si la VM acepta la conexión, se considera sana. Si deja de responder (se cayó la app, se reinició la VM o Azure desalojó la VM Spot), el balanceador **deja de mandarle tráfico** hasta que se recupere.
+
+Sin el probe, el balanceador seguiría enviando usuarios a una máquina muerta. Una sonda **HTTP** a una ruta como `/` sería todavía más precisa, porque comprobaría que la aplicación responde y no solo que el puerto está abierto.
+
+### ¿Cuál es el propósito de la *Load Balancing Rule*?
+
+Define **cómo** se reparte el tráfico. Indica:
+- qué IP y puerto del frontend escuchar (80);
+- a qué puerto del backend reenviar (3000);
+- con qué protocolo (TCP);
+- a qué backend pool;
+- con qué health probe se decide qué VMs están sanas;
+- qué tipo de persistencia de sesión usar.
+
+Gracias a esta regla el usuario entra por el puerto 80 estándar sin saber que la app corre en el 3000.
+
+### ¿Qué tipos de sesión persistente existen, por qué es importante y cómo afecta la escalabilidad?
+
+La persistencia (*session persistence* o *affinity*) decide si las peticiones de un mismo cliente deben ir siempre a la misma VM. En Azure Load Balancer hay tres modos:
+
+| Modo | Hash usado | Comportamiento |
+|---|---|---|
+| **None** (por defecto) | 5-tupla: IP origen, puerto origen, IP destino, puerto destino, protocolo | Cada conexión nueva puede caer en cualquier VM |
+| **Client IP** | 2-tupla: IP origen, IP destino | Todas las conexiones de una misma IP van a la misma VM |
+| **Client IP and protocol** | 3-tupla: IP origen, IP destino, protocolo | Igual que la anterior, pero separando por protocolo |
+
+**Por qué es importante:** si la aplicación guarda estado en memoria (una sesión de usuario, un carrito de compras), el cliente tiene que volver a la misma VM o perdería ese estado.
+
+**Cómo afecta la escalabilidad:** mientras más "pegajosa" es la persistencia, **peor se reparte la carga**. Si muchos usuarios salen por la misma IP (una universidad, una empresa detrás de un NAT), con *Client IP* todos caerían en la misma VM mientras las demás quedan ociosas. Además, al agregar VMs nuevas, los clientes existentes no se redistribuyen.
+
+Lo vimos en nuestras pruebas incluso con *None*. Como newman reutiliza la misma conexión TCP, cada cliente quedó pegado a una VM y la carga terminó desbalanceada (VM1 y VM2 con 26-27 peticiones, VM3 y VM4 con 6-8). Lo ideal para escalar es que la aplicación **no guarde estado** (*stateless*) y que el estado viva en un servicio externo, como una base de datos o Redis. Así se puede usar *None* y el balanceador reparte libremente.
+
+### ¿Qué es una *Virtual Network*? ¿Qué es una *Subnet*? ¿Para qué sirven el *address space* y el *address range*?
+
+- **Virtual Network (VNet):** es una red privada y aislada dentro de Azure, el equivalente a la red física de un datacenter propio. Los recursos que viven en ella se comunican entre sí con IPs privadas y quedan separados de otras redes, a menos que se conecten explícitamente (*peering*, VPN).
+- **Subnet:** es una división de la VNet. Sirve para organizar y aislar grupos de recursos (por ejemplo, una subnet para servidores web y otra para bases de datos) y para aplicar reglas distintas a cada grupo, como un NSG o una tabla de rutas.
+- **Address space:** es el rango total de IPs privadas que le pertenece a la VNet, escrito en notación CIDR. Nosotros usamos `10.1.0.0/16`, que da 65.536 direcciones (10.1.0.0 – 10.1.255.255). No se debe cruzar con el de otras redes a las que nos queramos conectar.
+- **Address range:** es el pedazo del address space que se le asigna a cada subnet. La nuestra es `10.1.0.0/24`, con 256 direcciones (10.1.0.0 – 10.1.0.255); Azure reserva 5 de ellas en cada subnet. De ahí salieron las IPs de las VMs: 10.1.0.4, 10.1.0.5 y 10.1.0.6.
+
+### ¿Qué son las *Availability Zones* y por qué seleccionamos 3 zonas diferentes?
+
+Una **zona de disponibilidad** es uno o varios datacenters físicamente separados dentro de la misma región. Cada zona tiene su propia energía, refrigeración y red, y están lo bastante lejos entre sí para que un incendio, una inundación o un corte eléctrico no las afecte a la vez, pero lo bastante cerca para que la latencia entre ellas sea mínima.
+
+Pusimos cada VM en una zona distinta (VM1 en la 1, VM2 en la 2, VM3 en la 3) para que **la caída de un datacenter completo no tumbe el servicio**: el health probe detecta las VMs caídas y el balanceador sigue enviando tráfico a las de las otras zonas. Si las tres estuvieran en la misma zona, el sistema sería escalable pero no tolerante a fallos. Con VMs en zonas distintas, Azure ofrece un SLA del 99.99%.
+
+### ¿Qué significa que una IP sea *zone-redundant*?
+
+Que la IP **no depende de una sola zona**. Azure la publica desde todas las zonas de la región al mismo tiempo, así que si una zona se cae, la IP sigue respondiendo desde las otras. Es lo que tiene que tener la IP del balanceador: de nada sirve repartir las VMs en 3 zonas si la puerta de entrada vive solo en una. La alternativa es una IP **zonal**, atada a una zona específica, que se cae con ella.
+
+### ¿Cuál es el propósito del *Network Security Group*?
+
+Es el **firewall** de la red. Contiene reglas que permiten o niegan tráfico de entrada y de salida según:
+- el origen y el destino;
+- el puerto;
+- el protocolo.
+
+Las reglas se evalúan por prioridad. Se puede asociar a una subnet o a la NIC de una VM.
+
+En nuestro caso, el NSG `SCALABILITY_LAB_NSG` permite la entrada por el **22** (SSH) y el **3000** (la app) y bloquea todo lo demás. Es especialmente importante con el balanceador Standard, que es seguro por defecto: sin la regla del puerto 3000, el balanceador no podría entregarle tráfico a las VMs aunque la regla de balanceo estuviera bien configurada. Las reglas por defecto del NSG ya permiten las sondas del balanceador (etiqueta `AzureLoadBalancer`), por eso el health probe funciona sin configurar nada más.
+
+### Diagrama de despliegue
+
+```mermaid
+flowchart TB
+    cliente["Cliente<br/>navegador / newman"]
+    admin["Administrador<br/>SSH"]
+
+    subgraph region["Azure - Brazil South · Resource group SCALABILITY_LAB_HORIZONTAL"]
+        pip["IP pública Standard<br/>20.195.246.246<br/>zone-redundant"]
+        lb["Load Balancer Standard<br/>Regla TCP 80 → 3000 · sin persistencia<br/>Health probe TCP 3000 cada 5 s<br/>NAT SSH 50001-50004 → 22<br/>Outbound rule (salida a internet)"]
+
+        subgraph vnet["VNet SCALABILITY_LAB_VIRTUAL_NETWORK · 10.1.0.0/16"]
+            subgraph subnet["Subnet SCALABILITY_LAB_SUBNET · 10.1.0.0/24 · NSG: permite 22 y 3000"]
+                subgraph z1["Zona 1"]
+                    vm1["VM1 · D2ds_v4<br/>10.1.0.4"]
+                    vm4["VM4 · D2ds_v4 Spot"]
+                end
+                subgraph z2["Zona 2"]
+                    vm2["VM2 · D2ds_v4<br/>10.1.0.5"]
+                end
+                subgraph z3["Zona 3"]
+                    vm3["VM3 · D2d_v4<br/>10.1.0.6"]
+                end
+            end
+        end
+    end
+
+    cliente -- "HTTP :80" --> pip
+    admin -- "SSH :50001-50004" --> pip
+    pip --> lb
+    lb -- ":3000" --> vm1
+    lb -- ":3000" --> vm2
+    lb -- ":3000" --> vm3
+    lb -- ":3000" --> vm4
+```
+
+Cada VM corre Ubuntu Server 24.04 con Node.js 22 LTS y la *FibonacciApp* como servicio `systemd` en el puerto 3000, instalada automáticamente con *cloud-init*.
+
+---
+
+## Conclusión general
+
+Con escalamiento horizontal **nos acercamos bastante más** al escenario de calidad que con el vertical. Cada VM tiene su propio proceso de Node, así que varios usuarios concurrentes se atienden en paralelo en lugar de hacer una sola fila. La mayoría de las peticiones se respondieron en el mismo tiempo que tarda una sola (~11 s), y la CPU de ninguna VM pasó del 70%.
+
+No lo cumplimos al 100%: hubo algunos `ECONNRESET` cuando el balanceador puso a dos clientes en la misma VM. La lección es que escalar la infraestructura ayuda mucho, pero no reemplaza tener una aplicación que no bloquee su único hilo. Para cumplir el escenario completo habría que combinar varias cosas:
+- más VMs, o un balanceo por petición (capa 7);
+- usar todos los núcleos de cada VM (modo *cluster* de Node o *worker threads*);
+- sobre todo, un algoritmo de Fibonacci más eficiente.

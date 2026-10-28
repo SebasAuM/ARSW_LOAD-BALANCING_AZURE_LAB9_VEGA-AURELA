@@ -38,7 +38,7 @@ PREFERIDOS=(
   Standard_D2as_v5 Standard_D2s_v5 Standard_D2as_v6 Standard_D2ads_v6
   Standard_D2s_v3 Standard_F2s_v2 Standard_F2as_v6
 )
-MAX_PLANES=20
+MAX_PLANES=8  # por tipo (normales y Spot)
 
 log()  { printf '\n\033[1;36m>> %s\033[0m\n' "$*"; }
 ok()   { printf '   \033[32m✔ %s\033[0m\n' "$*"; }
@@ -83,7 +83,8 @@ fi
 declare -A VCPUS FAMILIA GEN SPOT MOTIVO
 while IFS=$'\t' read -r name fam vcpu arch gens lowprio zonas restr; do
   if [[ -n "$restr" ]]; then MOTIVO[$name]=$restr; continue; fi
-  if [[ "$arch" != x64 || ! "$vcpu" =~ ^[0-9]+$ ]] || (( vcpu > 2 || zonas < 3 )); then
+  # Los DC/EC son VMs confidenciales y no arrancan con la imagen normal de Ubuntu
+  if [[ "$arch" != x64 || ! "$vcpu" =~ ^[0-9]+$ || "$name" =~ ^Standard_[DE]C ]] || (( vcpu > 2 || zonas < 3 )); then
     MOTIVO[$name]="no sirve para el lab (arq=$arch, zonas=$zonas, vCPU=$vcpu)"
     continue
   fi
@@ -110,10 +111,12 @@ rango() {
 # Plan = "tamaño prioridad", ordenado por vCPUs y luego por preferencia.
 # Primero todos los normales (cada familia tiene su propia cuota) y al final los Spot.
 ORDENADOS=$(for s in "${!VCPUS[@]}"; do echo "${VCPUS[$s]} $(rango "$s") $s"; done | sort -n -k1,1 -k2,2 | awk '{print $3}')
-DISPONIBLES=()
-for s in $ORDENADOS; do DISPONIBLES+=("$s Regular"); done
-for s in $ORDENADOS; do [[ "${SPOT[$s]}" == True ]] && DISPONIBLES+=("$s Spot"); done
-DISPONIBLES=("${DISPONIBLES[@]:0:$MAX_PLANES}")
+NORMALES=() SPOTS=()
+for s in $ORDENADOS; do
+  NORMALES+=("$s Regular")
+  [[ "${SPOT[$s]}" == True ]] && SPOTS+=("$s Spot")
+done
+DISPONIBLES=("${NORMALES[@]:0:$MAX_PLANES}" "${SPOTS[@]:0:$MAX_PLANES}")
 
 (( ${#DISPONIBLES[@]} )) || die "Ningún tamaño x64 de 1-2 vCPU está disponible en las 3 zonas de $LOC. Revisa $SKUS"
 echo "   Orden en que se intentará crear cada VM:"
@@ -298,8 +301,14 @@ cat > "$ENV" <<EOF
   ]
 }
 EOF
-[[ -x ~/newman/node_modules/.bin/newman ]] || npm install --silent --prefix ~/newman newman
 NEWMAN=~/newman/node_modules/.bin/newman
+if [[ ! -x $NEWMAN ]]; then
+  mkdir -p ~/newman
+  ( cd ~/newman && { [[ -f package.json ]] || npm init -y >/dev/null; } && npm install newman --no-audit --no-fund ) \
+    || die "No se pudo instalar newman (revisa el error de npm arriba)"
+fi
+"$NEWMAN" --version >/dev/null 2>&1 || die "newman no quedó instalado en $NEWMAN"
+ok "newman $("$NEWMAN" --version) listo"
 
 correr_newman() {
   local paralelos=$1 etiqueta=$2 pids=()
