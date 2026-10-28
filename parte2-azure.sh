@@ -7,6 +7,10 @@
 #   bash parte2-azure.sh borrar   elimina el grupo de recursos para no gastar créditos
 #
 # Se puede volver a ejecutar sin problema: las VMs que ya existen se omiten.
+#
+# Azure for Students solo permite 3 IPs públicas por región, así que las VMs no
+# llevan IP propia: salen a internet por el balanceador (outbound rule) y se
+# administran con "az vm run-command" en lugar de SSH.
 set -uo pipefail
 
 RG=SCALABILITY_LAB_HORIZONTAL
@@ -103,12 +107,12 @@ rango() {
   echo 999
 }
 
-# Plan = "tamaño prioridad", ordenado por vCPUs y luego por preferencia
+# Plan = "tamaño prioridad", ordenado por vCPUs y luego por preferencia.
+# Primero todos los normales (cada familia tiene su propia cuota) y al final los Spot.
+ORDENADOS=$(for s in "${!VCPUS[@]}"; do echo "${VCPUS[$s]} $(rango "$s") $s"; done | sort -n -k1,1 -k2,2 | awk '{print $3}')
 DISPONIBLES=()
-while read -r _ _ s; do
-  DISPONIBLES+=("$s Regular")
-  [[ "${SPOT[$s]}" == True ]] && DISPONIBLES+=("$s Spot")
-done < <(for s in "${!VCPUS[@]}"; do echo "${VCPUS[$s]} $(rango "$s") $s"; done | sort -n -k1,1 -k2,2)
+for s in $ORDENADOS; do DISPONIBLES+=("$s Regular"); done
+for s in $ORDENADOS; do [[ "${SPOT[$s]}" == True ]] && DISPONIBLES+=("$s Spot"); done
 DISPONIBLES=("${DISPONIBLES[@]:0:$MAX_PLANES}")
 
 (( ${#DISPONIBLES[@]} )) || die "Ningún tamaño x64 de 1-2 vCPU está disponible en las 3 zonas de $LOC. Revisa $SKUS"
@@ -145,12 +149,25 @@ az network public-ip create -g $RG -n $LBIP -l $LOC --sku Standard \
 az network lb show -g $RG -n $LB -o none 2>/dev/null || \
   az network lb create -g $RG -n $LB -l $LOC --sku Standard \
     --public-ip-address $LBIP --frontend-ip-name $FE --backend-pool-name $POOL -o none
-az network lb probe create -g $RG --lb-name $LB -n $PROBE \
-  --protocol Tcp --port 3000 --interval 5 --threshold 2 -o none
-az network lb rule create -g $RG --lb-name $LB -n $RULE \
-  --protocol Tcp --frontend-port 80 --backend-port 3000 \
-  --frontend-ip-name $FE --backend-pool-name $POOL --probe-name $PROBE \
-  --idle-timeout 4 -o none
+az network lb probe show -g $RG --lb-name $LB -n $PROBE -o none 2>/dev/null || \
+  az network lb probe create -g $RG --lb-name $LB -n $PROBE \
+    --protocol Tcp --port 3000 --interval 5 --probe-threshold 2 -o none
+
+# La regla deja el SNAT a la outbound rule, que usa la misma IP del balanceador
+if az network lb rule show -g $RG --lb-name $LB -n $RULE -o none 2>/dev/null; then
+  az network lb rule update -g $RG --lb-name $LB -n $RULE --disable-outbound-snat true -o none
+else
+  az network lb rule create -g $RG --lb-name $LB -n $RULE \
+    --protocol Tcp --frontend-port 80 --backend-port 3000 \
+    --frontend-ip-name $FE --backend-pool-name $POOL --probe-name $PROBE \
+    --idle-timeout 4 --disable-outbound-snat true -o none
+fi
+
+# Salida a internet de las VMs (apt, git, npm) sin IPs públicas propias
+az network lb outbound-rule show -g $RG --lb-name $LB -n OutboundRule -o none 2>/dev/null || \
+  az network lb outbound-rule create -g $RG --lb-name $LB -n OutboundRule \
+    --frontend-ip-configs $FE --address-pool $POOL \
+    --protocol All --idle-timeout 4 --outbound-ports 10000 -o none
 LB_PUBLIC_IP=$(az network public-ip show -g $RG -n $LBIP --query ipAddress -o tsv)
 ok "Balanceador listo en $LB_PUBLIC_IP"
 
@@ -189,11 +206,10 @@ crear_vm() {
     return 0
   fi
 
-  az network public-ip create -g $RG -n "$nombre-ip" -l $LOC --sku Standard \
-    --allocation-method Static --zone 1 2 3 -o none
   az network nic create -g $RG -n "$nombre-nic" -l $LOC \
     --vnet-name $VNET --subnet $SUBNET --network-security-group $NSG \
-    --public-ip-address "$nombre-ip" --lb-name $LB --lb-address-pools $POOL -o none
+    --lb-name $LB --lb-address-pools $POOL -o none \
+    || { warn "No se pudo crear la NIC de $nombre"; return 1; }
 
   leer_cuotas
   for p in "${DISPONIBLES[@]}"; do
@@ -238,18 +254,22 @@ crear_vm() {
   return 1
 }
 
+# Espera a que cloud-init termine dentro de la VM y prueba la app desde adentro
 esperar_app() {
-  local ip
-  ip=$(az vm show -d -g $RG -n "$1" --query publicIps -o tsv)
-  for _ in $(seq 60); do
-    if curl -s -m 5 "http://$ip:3000/" | grep -q Hello; then
-      ok "$1 ($ip) responde en el puerto 3000"
+  local salida
+  echo "   Esperando la instalación en $1..."
+  for _ in 1 2 3; do
+    salida=$(az vm run-command invoke -g $RG -n "$1" --command-id RunShellScript \
+      --scripts "cloud-init status --wait >/dev/null; curl -s -m 5 localhost:3000/ || tail -n 20 /var/log/cloud-init-output.log" \
+      --query "value[0].message" -o tsv 2>&1)
+    if grep -q Hello <<<"$salida"; then
+      ok "$1 responde en el puerto 3000"
       return 0
     fi
-    sleep 10
+    sleep 20
   done
-  warn "$1 ($ip) no respondió en 10 minutos. Revisa con:"
-  echo "     az vm run-command invoke -g $RG -n $1 --command-id RunShellScript --scripts 'tail -n 40 /var/log/cloud-init-output.log'"
+  warn "$1 no responde. Última salida:"
+  tail -n 20 <<<"$salida"
   return 1
 }
 
@@ -329,6 +349,6 @@ done
 log "Listo"
 echo "   IP del balanceador: http://$LB_PUBLIC_IP/fibonacci/6"
 echo "   Resultados de newman y CPU en: $OUT"
-az vm list -g $RG -d --query "[].{VM:name, Zona:zones[0], Tamano:hardwareProfile.vmSize, Prioridad:priority, IP:publicIps}" -o table
+az vm list -g $RG -d --query "[].{VM:name, Zona:zones[0], Tamano:hardwareProfile.vmSize, Prioridad:priority, IP:privateIps}" -o table
 echo
 echo "   Cuando terminen el informe: bash parte2-azure.sh borrar"
