@@ -3,6 +3,7 @@
 #
 # Uso (en Azure Cloud Shell - Bash):
 #   bash parte2-azure.sh          crea toda la infraestructura y corre las pruebas de newman
+#   bash parte2-azure.sh cuota    solo muestra la cuota de vCPUs y los tamaños disponibles
 #   bash parte2-azure.sh borrar   elimina el grupo de recursos para no gastar créditos
 #
 # Se puede volver a ejecutar sin problema: las VMs que ya existen se omiten.
@@ -11,6 +12,7 @@ set -uo pipefail
 RG=SCALABILITY_LAB_HORIZONTAL
 LOC=brazilsouth
 IMAGE=Canonical:ubuntu-24_04-lts:server:latest
+IMAGE_GEN1=Canonical:ubuntu-24_04-lts:server-gen1:latest
 ADMIN=scalability_lab
 VNET=SCALABILITY_LAB_VIRTUAL_NETWORK
 SUBNET=SCALABILITY_LAB_SUBNET
@@ -24,14 +26,15 @@ RULE=SCALABILITY_LAB_LOAD_BALANCING_RULE
 REPO=https://github.com/SebasAuM/ARSW_LOAD-BALANCING_AZURE_LAB9_VEGA-AURELA.git
 OUT=~/parte2-resultados
 
-# Tamaños preferidos, en orden. Si ninguno está disponible se prueba cualquier
-# otro tamaño x64 de 1-2 vCPU que la suscripción pueda usar en las 3 zonas.
+# Se intentan primero los tamaños con menos vCPUs (para que quepan 4 VMs en la
+# cuota de Azure for Students) y, a igual cantidad, en este orden de preferencia.
 PREFERIDOS=(
-  Standard_B1s Standard_B1ms Standard_B2ats_v2 Standard_B2als_v2 Standard_B2s
+  Standard_B1s Standard_B1ms Standard_A1_v2 Standard_F1s Standard_DS1_v2
+  Standard_B2ats_v2 Standard_B2als_v2 Standard_B2s
   Standard_D2as_v5 Standard_D2s_v5 Standard_D2as_v6 Standard_D2ads_v6
   Standard_D2s_v3 Standard_F2s_v2 Standard_F2as_v6
 )
-MAX_PLANES=15
+MAX_PLANES=20
 
 log()  { printf '\n\033[1;36m>> %s\033[0m\n' "$*"; }
 ok()   { printf '   \033[32m✔ %s\033[0m\n' "$*"; }
@@ -47,59 +50,79 @@ az account show -o none 2>/dev/null || die "No hay sesión de Azure. Ejecuta: az
 mkdir -p "$OUT"
 
 # ---------------------------------------------------------------------------
+# Cuotas: vCPUs libres por nombre (cores = normales, lowPriorityCores = Spot,
+# y una entrada por familia, p. ej. standardDASv5Family)
+declare -A LIBRE
+leer_cuotas() {
+  LIBRE=()
+  local n lim cur
+  while IFS=$'\t' read -r n lim cur; do
+    LIBRE[$n]=$(( lim - cur ))
+  done < <(az vm list-usage -l $LOC --query "[].[name.value, limit, currentValue]" -o tsv)
+}
+
+log "Leyendo la cuota de vCPUs en $LOC"
+leer_cuotas
+echo "   vCPUs libres: normales = ${LIBRE[cores]:-?} | Spot = ${LIBRE[lowPriorityCores]:-?}"
+
+# ---------------------------------------------------------------------------
 log "Consultando tamaños de VM en $LOC (una sola consulta, 30-90 segundos)"
 
-# Columnas: nombre, vCPUs, arquitectura, generaciones, admite Spot, nº de zonas, restricciones
-SKUS="$OUT/skus.tsv"
+# Columnas: nombre, familia, vCPUs, arquitectura, generaciones, admite Spot, nº de zonas, restricciones
+SKUS="$OUT/skus-v2.tsv"
 if [[ ! -s "$SKUS" ]]; then
   az vm list-skus -l $LOC --resource-type virtualMachines --all \
-    --query "[].[name, capabilities[?name=='vCPUs'].value | [0], capabilities[?name=='CpuArchitectureType'].value | [0], capabilities[?name=='HyperVGenerations'].value | [0], capabilities[?name=='LowPriorityCapable'].value | [0], length(locationInfo[0].zones || \`[]\`), join(',', restrictions[].reasonCode || \`[]\`)]" \
+    --query "[].[name, family, capabilities[?name=='vCPUs'].value | [0], capabilities[?name=='CpuArchitectureType'].value | [0], capabilities[?name=='HyperVGenerations'].value | [0], capabilities[?name=='LowPriorityCapable'].value | [0], length(locationInfo[0].zones || \`[]\`), join(',', restrictions[].reasonCode || \`[]\`)]" \
     -o tsv > "$SKUS" || die "No se pudo consultar el catálogo de tamaños"
 fi
 
-declare -A VCPUS SPOT MOTIVO
-while IFS=$'\t' read -r name vcpu arch gens lowprio zonas restr; do
+declare -A VCPUS FAMILIA GEN SPOT MOTIVO
+while IFS=$'\t' read -r name fam vcpu arch gens lowprio zonas restr; do
   if [[ -n "$restr" ]]; then MOTIVO[$name]=$restr; continue; fi
-  if [[ "$arch" != x64 || "$gens" != *V2* || ! "$vcpu" =~ ^[0-9]+$ ]] || (( vcpu > 2 || zonas < 3 )); then
+  if [[ "$arch" != x64 || ! "$vcpu" =~ ^[0-9]+$ ]] || (( vcpu > 2 || zonas < 3 )); then
     MOTIVO[$name]="no sirve para el lab (arq=$arch, zonas=$zonas, vCPU=$vcpu)"
     continue
   fi
   VCPUS[$name]=$vcpu
+  FAMILIA[$name]=$fam
   SPOT[$name]=$lowprio
+  if [[ "$gens" == *V2* ]]; then GEN[$name]=2; else GEN[$name]=1; fi
 done < "$SKUS"
 
-# Plan = "tamaño prioridad vCPUs": primero los preferidos, luego el resto por vCPUs
-DISPONIBLES=()
-declare -A AGREGADO
-agregar_plan() {
-  local s=$1
-  [[ -v VCPUS[$s] && ! -v AGREGADO[$s] ]] || return 0
-  AGREGADO[$s]=1
-  DISPONIBLES+=("$s Regular ${VCPUS[$s]}")
-  [[ "${SPOT[$s]}" == True ]] && DISPONIBLES+=("$s Spot ${VCPUS[$s]}")
-}
 for s in "${PREFERIDOS[@]}"; do
   if [[ -v VCPUS[$s] ]]; then
-    ok "$s disponible (${VCPUS[$s]} vCPU, Spot: ${SPOT[$s]})"
+    ok "$s disponible (${VCPUS[$s]} vCPU, Spot: ${SPOT[$s]}, cuota familia ${FAMILIA[$s]}: ${LIBRE[${FAMILIA[$s]}]:-?})"
   else
     warn "$s: ${MOTIVO[$s]:-no existe en $LOC}"
   fi
-  agregar_plan "$s"
 done
-for s in $(for n in "${!VCPUS[@]}"; do echo "${VCPUS[$n]} $n"; done | sort -n | awk '{print $2}'); do
-  agregar_plan "$s"
-done
+
+rango() {
+  local i
+  for i in "${!PREFERIDOS[@]}"; do [[ ${PREFERIDOS[$i]} == "$1" ]] && { echo "$i"; return; }; done
+  echo 999
+}
+
+# Plan = "tamaño prioridad", ordenado por vCPUs y luego por preferencia
+DISPONIBLES=()
+while read -r _ _ s; do
+  DISPONIBLES+=("$s Regular")
+  [[ "${SPOT[$s]}" == True ]] && DISPONIBLES+=("$s Spot")
+done < <(for s in "${!VCPUS[@]}"; do echo "${VCPUS[$s]} $(rango "$s") $s"; done | sort -n -k1,1 -k2,2)
 DISPONIBLES=("${DISPONIBLES[@]:0:$MAX_PLANES}")
 
 (( ${#DISPONIBLES[@]} )) || die "Ningún tamaño x64 de 1-2 vCPU está disponible en las 3 zonas de $LOC. Revisa $SKUS"
 echo "   Orden en que se intentará crear cada VM:"
 printf '     %s\n' "${DISPONIBLES[@]}"
 
-# vCPUs libres de la cuota: cores (normales) o lowPriorityCores (Spot)
-cuota_libre() {
-  az vm list-usage -l $LOC --query "[?name.value=='$1'] | [0].[limit, currentValue]" -o tsv \
-    | awk '{print $1 - $2}'
-}
+MIN_VCPU=${VCPUS[${DISPONIBLES[0]%% *}]}
+CABEN=$(( ${LIBRE[cores]:-0} / MIN_VCPU + ${LIBRE[lowPriorityCores]:-0} / MIN_VCPU ))
+if (( CABEN < 4 )); then
+  warn "Con la cuota actual caben como mucho $CABEN VMs de $MIN_VCPU vCPU (el lab pide 4)."
+  echo "     Libera vCPUs en $LOC (borra o desasigna otras VMs) o el script hará lo que alcance."
+fi
+
+[[ "${1:-}" == "cuota" ]] && exit 0
 
 # ---------------------------------------------------------------------------
 log "Creando grupo de recursos, red virtual y NSG"
@@ -172,23 +195,32 @@ crear_vm() {
     --vnet-name $VNET --subnet $SUBNET --network-security-group $NSG \
     --public-ip-address "$nombre-ip" --lb-name $LB --lb-address-pools $POOL -o none
 
+  leer_cuotas
   for p in "${DISPONIBLES[@]}"; do
-    read -r size prio vcpu <<<"$p"
-    local cuota=cores extra=()
+    read -r size prio <<<"$p"
+    local vcpu=${VCPUS[$size]} fam=${FAMILIA[$size]} image=$IMAGE extra=()
+    [[ ${GEN[$size]} == 1 ]] && image=$IMAGE_GEN1
+
     if [[ $prio == Spot ]]; then
-      cuota=lowPriorityCores
       extra=(--priority Spot --eviction-policy Deallocate --max-price -1)
-    fi
-    local libre
-    libre=$(cuota_libre $cuota)
-    if (( ${libre:-0} < vcpu )); then
-      warn "$size ($prio): sin cuota suficiente (libres: ${libre:-0})"
-      continue
+      if (( ${LIBRE[lowPriorityCores]:-999} < vcpu )); then
+        warn "$size (Spot): sin cuota Spot (libres: ${LIBRE[lowPriorityCores]})"
+        continue
+      fi
+    else
+      if (( ${LIBRE[cores]:-999} < vcpu )); then
+        warn "$size: sin cuota regional (libres: ${LIBRE[cores]})"
+        continue
+      fi
+      if [[ -v LIBRE[$fam] ]] && (( ${LIBRE[$fam]} < vcpu )); then
+        warn "$size: sin cuota en la familia $fam (libres: ${LIBRE[$fam]})"
+        continue
+      fi
     fi
 
     echo "   Creando $nombre con $size ($prio) en zona $zona..."
     if az vm create -g $RG -n "$nombre" -l $LOC --zone "$zona" \
-         --size "$size" --image $IMAGE \
+         --size "$size" --image "$image" \
          --admin-username $ADMIN --generate-ssh-keys \
          --nics "$nombre-nic" \
          --os-disk-name "$nombre-osdisk" --os-disk-delete-option Delete \
@@ -200,8 +232,10 @@ crear_vm() {
     warn "$size ($prio) falló, probando el siguiente tamaño"
     az vm delete -g $RG -n "$nombre" --yes -o none 2>/dev/null
     az disk delete -g $RG -n "$nombre-osdisk" --yes -o none 2>/dev/null
+    leer_cuotas
   done
-  die "No se pudo crear $nombre con ningún tamaño. Revisa la cuota con: az vm list-usage -l $LOC -o table"
+  warn "No se pudo crear $nombre con ningún tamaño. Cuota actual: az vm list-usage -l $LOC -o table"
+  return 1
 }
 
 esperar_app() {
@@ -221,7 +255,7 @@ esperar_app() {
 
 # ---------------------------------------------------------------------------
 log "Creando VM1, VM2 y VM3 (una por zona de disponibilidad)"
-for i in 1 2 3; do crear_vm "VM$i" "$i"; done
+for i in 1 2 3; do crear_vm "VM$i" "$i" || die "Sin VM$i no se puede continuar."; done
 
 log "Esperando a que cloud-init instale la app (3-5 minutos)"
 for i in 1 2 3; do esperar_app "VM$i"; done
@@ -267,24 +301,29 @@ correr_newman 2 "3vms-2paralelo"
 
 # ---------------------------------------------------------------------------
 log "Agregando VM4 (zona 1, Brazil South solo tiene 3 zonas)"
-crear_vm VM4 1
-esperar_app VM4
-
-log "Prueba 2: 4 VMs, 4 newman en paralelo (punto 3)"
-correr_newman 4 "4vms-4paralelo"
+VMS=(VM1 VM2 VM3)
+if crear_vm VM4 1 && esperar_app VM4; then
+  VMS+=(VM4)
+  log "Prueba 2: 4 VMs, 4 newman en paralelo (punto 3)"
+  correr_newman 4 "4vms-4paralelo"
+else
+  warn "No hubo cuota para VM4; la prueba de 4 newman en paralelo se hace con 3 VMs."
+  log "Prueba 2: 3 VMs, 4 newman en paralelo"
+  correr_newman 4 "3vms-4paralelo"
+fi
 
 # ---------------------------------------------------------------------------
 log "Esperando 5 minutos a que Azure publique las métricas de CPU"
 sleep 300
-for i in 1 2 3 4; do
+for vm in "${VMS[@]}"; do
   {
-    echo "== VM$i: Percentage CPU (timestamp, promedio, máximo) =="
+    echo "== $vm: Percentage CPU (timestamp, promedio, máximo) =="
     az monitor metrics list \
-      --resource "$(az vm show -g $RG -n VM$i --query id -o tsv)" \
+      --resource "$(az vm show -g $RG -n "$vm" --query id -o tsv)" \
       --metric "Percentage CPU" --interval PT1M --aggregation Average Maximum \
       --start-time "$INICIO" \
       --query "value[0].timeseries[0].data[].[timeStamp, average, maximum]" -o tsv
-  } | tee "$OUT/cpu-VM$i.txt"
+  } | tee "$OUT/cpu-$vm.txt"
 done
 
 log "Listo"
